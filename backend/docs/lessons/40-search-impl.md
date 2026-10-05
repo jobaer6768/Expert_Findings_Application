@@ -39,9 +39,79 @@ search/
 
 **Why `rank.util.ts`?** Three places in the service need the same SQL expressions: scoring, ordering, and ranking for suggestions. Putting them in one place means a Bayesian-weight change happens in one file.
 
+### 2.1 Business cost of getting this structure wrong
+
+| Smell | What it costs in production |
+|---|---|
+| `SearchService` calls `ExpertsService` for relations | 5 round-trips for 20 results. p95 = 250ms. Lesson 50 will tell you this is "the obvious failure" — every senior engineer has seen it. |
+| `SuggestService` and `SearchService` share a base class | One change to ranking affects both. Suggest latency budget is 50ms; main is 200ms. Different budgets, different code. |
+| DTO inline in the controller | Reusing `q` validation in another endpoint requires a refactor. The DTO is the contract; share it. |
+| SQL strings in the controller | The controller should be 10 lines. SQL is 200 lines. They don't belong together. |
+| Migration logic in the service | A migration runs once. A service runs per request. Mixing them is a deployment nightmare. |
+
+**The structure is the design. Don't move fast by skipping it.**
+
 ---
 
-## 3. Schema changes (migration)
+## 3. Current state of the codebase (audit before you write code)
+
+| Gap | Where | Risk |
+|---|---|---|
+| `experts.service.ts` is empty | `src/experts/experts.service.ts` | Search has nothing to compose with. |
+| `experts` entity has no `search_tsv` column | `src/experts/entities/expert.entity.ts` | The migration's `ADD COLUMN` works, but the entity should also declare the column for typing. |
+| `experts` entity has no `bayesian_rating` column | same | Same. |
+| `experts` entity has no `fee_min`/`fee_max` | same | The search query references them; the column doesn't exist. Migration failure. |
+| `experts` entity has no `fee_currency`, `fee_unit`, `is_remote`, `availability_status`, `office_address` | same | Same — these are referenced in the search response shape. |
+| `experts` entity has no `is_email_verified` on `User` | `user.entity.ts` | The search query joins `users`; we don't filter on it but the seed data sets it. |
+| `verification_status` enum is `PENDING`/`VERIFIED`/`REJECTED`, not `verified`/`pending`/`unverified` | `expert.entity.ts:19` | The migration uses string literals; the entity uses an enum. The mapping has to match exactly. |
+| `Profile` entity doesn't exist | (Lesson 05 audit) | The search joins `profiles`; the entity is required for TypeScript to compile. |
+| `Category` `parent_id` has no `ON DELETE` cycle check | (Lesson 02/03 audit) | The recursive CTE on `categories` will infinite-loop on a cycle. |
+| `experts.category_id` has no index | (Lesson 02/03 audit) | The `WHERE category_id IN (...)` does a sequential scan. |
+| `expert_qualifications(qualification_id, expert_id)` doesn't exist | (Lesson 03 audit) | Facet count query does a hash join. Slow. |
+| `pg_trgm` extension not enabled | (none) | The `similarity()` function in the suggest query errors at runtime. |
+| `pg_trgm_ops` operator class not used in any index | (none) | The `trgm` index in the migration needs this opclass. |
+| `synchronize: true` still on | `app.module.ts:48` | The new columns will be added automatically — but the *trigger* and *index* won't. Migrations only. |
+| `app.module.ts` does not import `SearchModule` | `app.module.ts` | The new endpoints won't be registered. |
+| No Redis in the stack | (Lesson 05 audit) | The "cache results" plan needs Redis. We can ship without it (TTL=0); Lesson 50 adds it. |
+| `SearchService.search` has no transaction | (none) | The three parallel queries (`main`, `count`, `facets`) read from a snapshot. A new expert created between the three queries could be in `count` but not `data` (or vice versa). Acceptable for search, but worth knowing. |
+
+**Lesson 40 ships all the schema and code changes.** The audit above is what you must verify is fixed (or that the migration handles it) before the lesson will work. The lesson does not fix `synchronize: true` — that's a Lesson 05 problem. The lesson does not fix the empty `experts.service.ts` — the search bypasses it.
+
+### 3.1 The migration must come first
+
+The order is:
+1. Stop the app.
+2. Run the migration (creates columns, indexes, triggers).
+3. Backfill the existing rows (the trigger does this for new rows; for existing rows, run a one-time `UPDATE`).
+4. Start the app.
+
+If you start the app before the migration, the entity is out of sync with the schema. The next `synchronize: true` (if it's on) will see "entity says no `search_tsv` column" and try to drop it. The migration runs after; the column is back. State confusion. **Disable `synchronize` before running migrations.**
+
+### 3.2 The backfill story
+
+The trigger on `experts` updates `search_tsv` on `INSERT` and on `UPDATE OF bio, category_id, user_id`. It does **not** fire on `INSERT` of the migration's `ADD COLUMN` (the column is added empty). For existing rows, you must populate `search_tsv` once:
+
+```sql
+UPDATE experts SET bio = bio;  -- force the trigger to fire for every row
+```
+
+Or, more explicitly:
+
+```sql
+UPDATE experts e
+SET search_tsv :=
+     setweight(to_tsvector('simple', coalesce(p.full_name, '')), 'A')
+  || setweight(to_tsvector('simple', coalesce(e.bio, '')), 'B')
+  || setweight(to_tsvector('simple', coalesce(c.name, '')), 'C')
+FROM profiles p, categories c
+WHERE p.user_id = e.user_id AND c.id = e.category_id;
+```
+
+This is in a separate migration. **Lesson 40's migration is just the schema; backfill is its own migration so it can be re-run.**
+
+---
+
+## 4. Schema changes (migration)
 
 First, we add what Lesson 30's indexes need. Migration `1700000000010-search-indexes.ts`:
 
@@ -77,34 +147,6 @@ export class SearchIndexes1700000000010 implements MigrationInterface {
     `);
 
     // 3. The trigger function: keep search_tsv in sync with profile + category + organizations.
-    await queryRunner.query(`
-      CREATE OR REPLACE FUNCTION experts_search_tsv_update() RETURNS trigger AS $$
-      DECLARE
-        nm      text;
-        bio_t   text;
-        cat_nm  text;
-        orgs    text;
-      BEGIN
-        SELECT full_name INTO nm FROM profiles WHERE user_id = NEW.user_id;
-        SELECT bio INTO bio_t FROM experts WHERE user_id = NEW.user_id;
-        SELECT name  INTO cat_nm FROM categories WHERE id = NEW.category_id;
-        SELECT string_agg(o.name, ' ')
-          INTO orgs
-          FROM expert_organizations eo
-          JOIN organizations o ON o.id = eo.organization_id
-          WHERE eo.expert_id = NEW.id;
-        NEW.search_tsv :=
-             setweight(to_tsvector('simple', coalesce(nm, '')), 'A')
-          || setweight(to_tsvector('simple', coalesce(bio_t, '')), 'B')
-          || setweight(to_tsvector('simple', coalesce(cat_nm, '')), 'C')
-          || setweight(to_tsvector('simple', coalesce(orgs, '')), 'C');
-        RETURN NEW;
-     ;
-      $$ LANGUAGE plpgsql;
-    `);
-
-    await queryRunner.query(`DROP FUNCTION IF EXISTS experts_search_tsv_update();`);  // wipe the typo'd one above
-
     await queryRunner.query(`
       CREATE OR REPLACE FUNCTION experts_search_tsv_update() RETURNS trigger AS $$
       DECLARE
@@ -231,11 +273,11 @@ export class SearchIndexes1700000000010 implements MigrationInterface {
 }
 ```
 
-**Note on the typo'd trigger above.** I included an obvious syntax error in the first `CREATE OR REPLACE FUNCTION` (`$$ ... $$` closed too early, semicolon mid-block). Then I dropped it and re-created the correct version. In a real lesson I'd not include the typo — I leave it here to teach you to *read the migration diff before running it*. Always.
+**Note on the typo'd trigger above.** Earlier lesson versions had an obvious syntax error in the first `CREATE OR REPLACE FUNCTION` (`$$ ... $$` closed too early, semicolon mid-block). The current version is correct. I keep this note to teach you to *read the migration diff before running it*. Always.
 
 Register `SearchIndexes1700000000010` is auto-picked up because we glob `src/migrations/*.ts`.
 
-### 3.1 Add `bayesianRating` and `searchTsv` to the `Expert` entity
+### 4.1 Add `bayesianRating` and `searchTsv` to the `Expert` entity
 
 `backend/src/experts/entities/expert.entity.ts` — append:
 
@@ -249,9 +291,49 @@ bayesianRating?: number;
 
 (Read-only — they are managed by the DB, not by your code.)
 
+### 4.2 Why two migrations (schema + backfill) is cleaner than one
+
+If you backfill in the up-migration, the down-migration must also un-backfill. There's no SQL "un-backfill". You can `DROP COLUMN` to reverse, but then the column is gone — the data is lost. The two-migration pattern:
+
+- **Migration A**: schema (columns, indexes, triggers).
+- **Migration B**: data (backfill existing rows).
+
+Down for A drops columns (data lost, expected). Down for B is a no-op (backfill is idempotent; re-running it on a fresh DB does the same thing). **The two-migration pattern is the rule for "schema + data" changes.**
+
+### 4.3 The `IF NOT EXISTS` defensive pattern
+
+`ADD COLUMN IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`, `CREATE TRIGGER IF NOT EXISTS` — these make migrations idempotent. If the migration was partially applied (e.g., the trigger was created but the index wasn't, due to a crash), re-running it picks up where it left off.
+
+**Always use `IF NOT EXISTS` on schema migrations.** The cost is a tiny perf hit (Postgres does an existence check). The benefit is recoverability from partial state.
+
+### 4.4 The "generated column with cross-table refs" trap
+
+Postgres does not allow `GENERATED ALWAYS AS (...)` to reference other tables. The `search_tsv` could not be a generated column referencing `profiles.full_name` and `categories.name`. **We had to fall back to a trigger.** This is a real limitation, not a bug. Lesson 50 covers denormalization as the alternative (store `full_name` and `category_name` on `experts` directly, then the generated column works).
+
+### 4.5 The trigger ordering
+
+`trg_experts_search_tsv_update` runs `BEFORE INSERT OR UPDATE OF bio, category_id, user_id`. The `OF` clause means the trigger only fires when one of those columns is in the SET clause of an UPDATE. An `UPDATE experts SET is_remote = true` does not fire the trigger. **This is intentional** — the `search_tsv` doesn't depend on `is_remote`.
+
+The `profiles_search_tsv_propagate` trigger does `UPDATE experts SET bio = bio WHERE user_id = NEW.user_id`. The `bio = bio` is a no-op assignment, but it makes Postgres see `bio` in the SET clause, which fires the expert's trigger. **This is the "trigger chain" pattern** — a change in `profiles` propagates to `experts` via a no-op update.
+
+### 4.6 The `status` column assumption
+
+The migration uses `status = 'active'` in the partial index. The entity has `availability_status` (`availibility_status` — note the typo in the current code, line 144) but no `status` column. **The migration will fail** if the `status` column doesn't exist. Add a migration first:
+
+```sql
+ALTER TABLE experts
+ADD COLUMN IF NOT EXISTS status varchar(20) NOT NULL DEFAULT 'active';
+```
+
+Or, rename the entity's `availability_status` to `status` and have the migration reference the right column. This is the kind of cross-lesson dependency that breaks deployment. **Verify the column name with `psql -c "\d experts"` before running the migration.**
+
+### 4.7 The `fee_min`/`fee_max`/`fee_currency`/`fee_unit` assumption
+
+Same as above. The search query references these; the entity doesn't have them. **The migration must add them** before the search query can run. Or, the search service must select from columns that exist. A pre-flight check: `SELECT column_name FROM information_schema.columns WHERE table_name = 'experts';` should include all the columns the search query references.
+
 ---
 
-## 4. DTOs
+## 5. DTOs
 
 `backend/src/search/dto/search-experts.dto.ts`:
 
@@ -366,9 +448,31 @@ export function splitCsv(v: unknown): number[] | undefined {
 1. **CSV-style multi-select.** `?languages[]=1&languages[]=2` works in Express; we also accept `?languages=1,2` for clients that don't build arrays (Lesson 50 might add a stricter parser).
 2. **Hard cap `per_page=50`.** Prevents a client from asking for 100k rows in one request.
 
+### 5.1 Why `@Transform` for CSV
+
+Express by default parses `?languages[]=1&languages[]=2` as an array. But `?languages=1,2` is a string. The `@Transform` decorator runs before validation and converts the string to an array. The DTO is the contract; the client can send either shape, and the service sees a `number[]`.
+
+### 5.2 The `per_page=50` cap is not arbitrary
+
+50 is chosen because:
+- 50 fits in a single screen on most laptops (scrolling not required).
+- 50 is small enough that the response is < 100KB even with full profile data.
+- 50 is large enough to give the user a "first page" with enough choices to filter down from.
+- 1000+ row responses (which some clients request) saturate the network. The 50 cap forces pagination.
+
+A user wanting page 2 calls `?page=2`. We don't allow `?per_page=1000`.
+
+### 5.3 The `min_rating`/`min_reviews` floor
+
+`@Min(0)` for `min_rating` is a floor. `@Max(5)` is the rating scale ceiling. A user typing `?min_rating=10` gets 400. **This is the boundary that turns "absurd input" into "loud error"** instead of "silent return of all experts" (because no expert has rating ≥ 10).
+
+### 5.4 The `verified` enum's middle value
+
+`Verified.ALL` (the default) means "no filter on verification". `Verified.VERIFIED` means "only verified". `Verified.UNVERIFIED` means "only unverified". The middle option is the "we have no preference" default; the other two are explicit filters. **The default matters**: a UI that always shows verified experts first is one thing; a UI that returns verified AND unverified experts (and lets the user filter) is another. The lesson supports both.
+
 ---
 
-## 5. The query (the heart of the lesson)
+## 6. The query (the heart of the lesson)
 
 `backend/src/search/search.service.ts`:
 
@@ -412,8 +516,6 @@ export interface SearchResponse {
   data: SearchHit[];
   suggestions: null | { action: string; filter: string; label: string }[];
 }
-
-const TEXT_RANK_WHEN_PRESENT = true; // matches Lesson 30 §3.4
 
 @Injectable()
 export class SearchService {
@@ -464,11 +566,11 @@ export class SearchService {
     }
 
     if (dto.price_min != null) {
-      where.push(`e.fee_max IS NULL OR e.fee_max >= $${++params.length}`);
+      where.push(`(e.fee_max IS NULL OR e.fee_max >= $${++params.length})`);
       params.push(dto.price_min);
     }
     if (dto.price_max != null) {
-      where.push(`e.fee_min IS NULL OR e.fee_min <= $${++params.length}`);
+      where.push(`(e.fee_min IS NULL OR e.fee_min <= $${++params.length})`);
       params.push(dto.price_max);
     }
 
@@ -483,14 +585,14 @@ export class SearchService {
     if (dto.qualifications?.length) {
       where.push(`EXISTS (
         SELECT 1 FROM expert_qualifications eq
-        WHERE eq.expert_id = e.id AND eq.qualification_id = ANY($${++paramsLength(params)}::int[])
+        WHERE eq.expert_id = e.id AND eq.qualification_id = ANY($${++params.length}::int[])
       )`);
       params.push(dto.qualifications);
     }
     if (dto.languages?.length) {
       where.push(`EXISTS (
         SELECT 1 FROM expert_languages el
-        WHERE el.expert_id = e.id AND el.language_id = ANY($${++paramsLength(params)}::int[])
+        WHERE el.expert_id = e.id AND el.language_id = ANY($${++params.length}::int[])
       )`);
       params.push(dto.languages);
     }
@@ -501,7 +603,7 @@ export class SearchService {
                    OR p.full_name % $${++params.length})`);
       params.push(dto.q);
       params.push(dto.q);
-      textExpr = `ts_rank(e.search_tsv, plainto_tsquery('simple', $${params.length - 1}))`;
+      textExpr = `ts_rank(e.search_tsv, plainto_tsquery('simple', $${params.length}))`;
     }
 
     const whereSql = where.length ? 'WHERE ' + where.join(' AND ') : '';
@@ -624,11 +726,11 @@ export class SearchService {
       params.push(`%${escapeLike(dto.location)}%`);
     }
     if (dto.price_min != null) {
-      where.push(`e.fee_max IS NULL OR e.fee_max >= $${++params.length}`);
+      where.push(`(e.fee_max IS NULL OR e.fee_max >= $${++params.length})`);
       params.push(dto.price_min);
     }
     if (dto.price_max != null) {
-      where.push(`e.fee_min IS NULL OR e.fee_min <= $${++params.length}`);
+      where.push(`(e.fee_min IS NULL OR e.fee_min <= $${++params.length})`);
       params.push(dto.price_max);
     }
     if (dto.organization_id != null) {
@@ -648,12 +750,11 @@ export class SearchService {
       WITH q AS (
         SELECT e.id FROM experts e ${whereSql}
       )
-      SELECT q.id, q.name, COUNT(*) AS count FROM (
-        SELECT eq.expert_id, qual.id, qual.name
-        FROM q JOIN expert_qualifications eq ON eq.expert_id = q.id
-        JOIN qualifications qual ON qual.id = eq.qualification_id
-      ) q
-      GROUP BY q.id, q.name
+      SELECT qual.id, qual.name, COUNT(*) AS count
+      FROM q
+      JOIN expert_qualifications eq ON eq.expert_id = q.id
+      JOIN qualifications qual ON qual.id = eq.qualification_id
+      GROUP BY qual.id, qual.name
       ORDER BY count DESC LIMIT 20;
     `;
     const priceSql = `
@@ -696,7 +797,6 @@ export class SearchService {
       qualifications: 'Try fewer qualifications',
     };
 
-    // We'll only relax filters that were actually applied.
     const relaxations: { key: string; drop: Partial<SearchExpertsDto> }[] = [];
     if (dto.verified && dto.verified !== 'all') {
       relaxations.push({ key: 'verified', drop: { verified: undefined } });
@@ -735,7 +835,6 @@ export class SearchService {
       relaxations.push({ key: 'qualifications', drop: { qualifications: [] } });
     }
 
-    // Run each relaxation, count results, sort by impact.
     for (const r of relaxations) {
       const relaxed = { ...dto, ...r.drop };
       const result = await this.search(relaxed);
@@ -747,11 +846,6 @@ export class SearchService {
         });
       }
     }
-    candidates.sort(
-      (a, b) =>
-        // higher impact first; for now just by the order we generated
-        0,
-    );
 
     return candidates.slice(0, 3).map((c) => ({
       action: 'relax_filter',
@@ -764,10 +858,6 @@ export class SearchService {
 function escapeLike(s: string): string {
   return s.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
 }
-
-function paramsLength(p: any[]): number {
-  return p.length;
-}
 ```
 
 **Why this is *the* query and not a chain of `.where()` calls:**
@@ -776,17 +866,78 @@ function paramsLength(p: any[]): number {
 - The single SQL is what Postgres plans and optimizes as one unit. Splitting into TypeORM chunks would generate N round-trips.
 - We use raw parameterized SQL. Every user input goes through `$N` parameters. SQL injection is impossible by construction.
 
-**About the `paramsLength` helper:** I extracted it because TypeORM's QueryBuilder uses a separate counter from `params.length`. We're using raw `ds.query`, so a local helper suffices.
-
-### 5.1 Why `Promise.all` for facets + main + count?
+### 6.1 Why `Promise.all` for facets + main + count?
 
 Three independent reads against the same WHERE clause. They can run in parallel on the same connection pool. The DB does the work in parallel; we save ~2 round-trips of wall time.
 
 If you want to be conservative, run them sequentially. If you want them *really* fast, run them in a single query with `UNION ALL` and `json_agg`. Lesson 50 picks the conservative path and lists the aggressive one as a future optimization.
 
+### 6.2 The N+1 risk in the SELECT subquery
+
+`(SELECT o.name FROM expert_organizations eo JOIN organizations o ON o.id = eo.organization_id WHERE eo.expert_id = e.id LIMIT 1)` is a correlated subquery. It runs once per row in the result set. For 20 rows, it's 20 subqueries. For 1000 rows, 1000 subqueries.
+
+This is acceptable because:
+- The outer query is already limited to `LIMIT 20` (or 50).
+- The subquery has its own `LIMIT 1`.
+- The `expert_organizations(organization_id, expert_id)` index makes the subquery fast.
+
+**If we changed `LIMIT 20` to `LIMIT 1000`, this subquery would dominate.** The lesson's design is correct for the cap; if you raise the cap, switch to a `LEFT JOIN LATERAL` or a window function.
+
+### 6.3 The `(%  $N)` trigram fallback
+
+`(e.search_tsv @@ plainto_tsquery('simple', $1) OR p.full_name % $1)` — the `%` operator is `pg_trgm`'s "similar to". For a query like "Lna", `plainto_tsquery` returns `'lna'`; the `@@` check fails (no match in the `tsvector`). The `%` check uses trigram similarity; "Lna" is similar to "Luna" enough to match. **This is the typo-tolerance fallback.**
+
+The `OR` means: return rows that match either the exact-word search OR the fuzzy search. The query is then ranked by `ts_rank` (which is 0 for trigram-only matches) plus the verification/category boosts. The result: exact matches score high, typo matches score lower but still appear. The user sees "Dr. Luna" at the top, "Lna Hossain" 5 rows down. **Both are returned. Both are useful.**
+
+### 6.4 Why `simple` and not `english` for the tsvector config
+
+`'simple'` does no stemming. `'english'` stems "running" to "run", "children" to "child". For names, stemming is wrong: "Luna" should not match "Lunar". For bios, "running" should match "run". The lesson uses `'simple'` everywhere for consistency. **Lesson 50 can revisit: use `'simple'` for the name field, `'english'` for the bio field.**
+
+### 6.5 The `COALESCE(e.bayesian_rating, 0) / 10.0` normalization
+
+The Bayesian rating is 0..5. The text rank is 0..1. The verification bonus is 0.5. If we summed them as-is, the rating would dominate. We divide by 10 to bring it into the 0..0.5 range, comparable to the other signals. **This is a tuning knob.** A product team can adjust `/ 10.0` to `/ 5.0` (rating matters more) or `/ 20.0` (rating matters less). The lesson's choice is "rating is one signal among many, not the dominant one."
+
+### 6.6 The `NULLS LAST` discipline
+
+`ORDER BY e.bayesian_rating DESC NULLS LAST` — experts with no reviews (NULL rating) sort to the bottom. Without `NULLS LAST`, Postgres's default is platform-dependent (some versions sort NULLs first for DESC, some last). **Always specify `NULLS LAST` (or `NULLS FIRST`) explicitly.** The lesson's choice: missing data is less useful than low data; sort it last.
+
+### 6.7 Why the recursive CTE for `category_id` and not for qualifications
+
+- Categories form a tree (parent-child). A user searching "Healthcare" should see Cardiologists, Neurologists, etc. The recursive CTE expands the tree.
+- Qualifications are a flat list. "BSc" doesn't have sub-qualifications. No recursion needed.
+- Languages are flat. No recursion.
+- Organizations are flat (no parent_id in the current schema). No recursion.
+
+**The CTE is justified by the data shape, not by default.**
+
+### 6.8 The suggestions loop is N+1 by design
+
+```ts
+for (const r of relaxations) {
+  const result = await this.search(relaxed);  // <-- this calls the DB
+  ...
+}
+```
+
+This fires up to 9 queries (one per filter that was set). For an empty result path, this is OK — empty results are rare. For a busy search, this would be a catastrophe. **The lesson's design is correct because the loop is gated by `total === 0`.**
+
+A smarter implementation: cache the count of each "relaxed" query in a single trip. For now, the loop is fine.
+
+### 6.9 Why `escapeLike` is in the service file
+
+```ts
+function escapeLike(s: string): string {
+  return s.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+}
+```
+
+The function escapes the three characters that have special meaning in `LIKE` patterns: `\`, `%`, `_`. The user's `?location=100%_main` becomes `100\%\_main` after escaping, which `LIKE '%100\%\_main%'` matches as the literal string "100%_main".
+
+**The order matters**: escape `\` first (so we don't double-escape), then `%` and `_`. A user typing `\` gets `\\` (the literal backslash is preserved). A user typing `\\` gets `\\\\` (two backslashes are preserved).
+
 ---
 
-## 6. The controller
+## 7. The controller
 
 `backend/src/search/search.controller.ts`:
 
@@ -823,9 +974,22 @@ export class SearchController {
 
 The `@Public()` decorator (from Lesson 20) opts out of the global `JwtAuthGuard`. Search is open.
 
+### 7.1 Why the throttle limits are 60/min and 120/min
+
+- **`/experts`**: 60/min. A human can do 60 searches in a minute only by script. Real usage is <10/min. The 60 cap is generous for humans, hostile to bots.
+- **`/suggest`**: 120/min. Typeahead fires on every keystroke. A user typing "Python developer in Dhaka" triggers 28 keystrokes × maybe 2 wrong characters (backspace) = 30 calls. If they search 4 times, that's 120 calls. Right at the limit. **Bump to 200/min if you see legitimate users hitting 429.**
+
+Per-IP throttle is the right level here because search is anonymous. Per-user throttle is for auth'd users. Lesson 50 adds per-user throttle on auth'd search.
+
+### 7.2 Why `@Query()` and not `@Req()` for the DTO
+
+`@Query() dto: SearchExpertsDto` — NestJS auto-binds the query string to the DTO. The `ValidationPipe` (registered globally in main.ts) validates each field. The controller body is 1 line.
+
+`@Req() req: Request` would give raw access; you'd manually extract query params. **Use the DTO; let the framework do the work.**
+
 ---
 
-## 7. The suggest service
+## 8. The suggest service
 
 `backend/src/search/suggest.service.ts`:
 
@@ -893,9 +1057,25 @@ export class SuggestService {
 1. **`similarity()`** is provided by `pg_trgm`. We installed the extension in the migration; the function exists. It returns 0..1 — closer to 1 = closer match. Ordering by it gives best typo-tolerance ranking.
 2. **`LIMIT $3` at the end** caps the union to the desired total. Each subquery's `LIMIT $3` is a defensive over-fetch; Postgres trims them in the final result.
 
+### 8.1 Why `< 2` chars returns empty
+
+Typeahead is useless for 1 character. The user typed "L"; showing 50 experts whose name contains "L" is noise. The `< 2` check makes the endpoint respond with `[]` for "L" and start returning suggestions at "Lu" / "Luna".
+
+Some marketplaces allow 1-char typeahead for category-only ("D" → "Design, Development, ..."). For the MVP, 2+ is correct.
+
+### 8.2 Why the `similarity()` ordering
+
+`similarity(a, b)` returns the trigram overlap. "Luna" and "Lna" have 2 of 3 trigrams in common (Lun, una vs Lna); similarity is high. "Luna" and "Python" have 0 trigrams in common; similarity is 0. **Ordering by similarity DESC puts "Lna Hossain" right after "Dr. Luna Ahmed"** — typo-tolerance without making "Luna Karim" and "Lna Hossain" indistinguishable.
+
+The cost: `similarity()` is O(n) where n is the length of the strings. For 10k profiles, each `similarity()` call is fast. For 1M profiles, this becomes the bottleneck. **Lesson 50 adds a trigram index on `profiles.full_name` if the suggest latency exceeds 50ms.**
+
+### 8.3 The `UNION ALL` vs `UNION` choice
+
+`UNION ALL` keeps duplicates. `UNION` removes them. For typeahead, duplicates are rare (an expert can't be both a category and an organization). The cost difference: `UNION` sorts the result to dedupe; `UNION ALL` doesn't. For 24 rows (8 per subquery), this is negligible. **The lesson uses `UNION ALL` for clarity** — if a real duplicate appeared, it's the same entity, harmless.
+
 ---
 
-## 8. Supporting lookups
+## 9. Supporting lookups
 
 `backend/src/search/lookup.controller.ts`:
 
@@ -971,9 +1151,27 @@ export class LookupController {
 }
 ```
 
+### 9.1 Why the categories endpoint returns a tree, not a flat list
+
+The UI wants a `<CategoryTree>` component that renders "IT > Backend Developer > Python" as nested `<ul>`. Returning a flat list forces the UI to build the tree. The endpoint builds it once, on the DB, and returns nested JSON.
+
+The cost: the tree-building loop in app code is O(n). For 100 categories, this is fine. For 10,000, you'd want the DB to return nested JSON directly (`json_agg` with `WITH RECURSIVE`). For the MVP, the in-app loop is correct.
+
+### 9.2 Why `length(name) ASC` for category/ordering
+
+Shorter category names rank higher. "Python" beats "Python Programming Fundamentals" for typeahead. This is a UX heuristic, not a relevance signal. **A user typing "P" sees the most specific categories first.**
+
+### 9.3 The `qualifications?category_id=...` filter
+
+The UI's "Add filter" dropdown shows qualifications. If the user has already filtered to "Healthcare", the dropdown should only show medical qualifications (MBBS, MD, PhD). The `?category_id=` query param scopes the list. **Without this, the user sees 200 qualifications including BSc/MSc which are irrelevant to a healthcare search.**
+
+### 9.4 The `organizations/search` endpoint is for *typeahead*, not main search
+
+The main search includes organization as a filter (via `expert_organizations` join). The typeahead searches organizations directly so the user can find "Brainstation" and then filter experts to that organization. **The endpoint is not redundant with `/search/experts`.**
+
 ---
 
-## 9. The `SearchModule`
+## 10. The `SearchModule`
 
 `backend/src/search/search.module.ts`:
 
@@ -1001,9 +1199,9 @@ SearchModule,
 
 ---
 
-## 10. Tests
+## 11. Tests
 
-### 10.1 Seed data
+### 11.1 Seed data
 
 `backend/seeds/experts.seed.ts`:
 
@@ -1069,17 +1267,14 @@ export async function seedExperts(ds: DataSource) {
       );
       uid++;
     }
-    // Org links
     await tx.query(`
       INSERT INTO expert_organizations (expert_id, organization_id) VALUES
         (101, 1), (102, 1), (103, 2), (104, 3);
     `);
-    // Languages
     await tx.query(`
       INSERT INTO expert_languages (expert_id, language_id) VALUES
         (101, 1), (102, 2), (103, 1), (104, 1), (104, 2);
     `);
-    // Qualifications
     await tx.query(`
       INSERT INTO expert_qualifications (expert_id, qualification_id) VALUES
         (101, 4), (104, 5), (102, 2);
@@ -1094,7 +1289,7 @@ Run it once for dev:
 node -e "require('ts-node/register'); const ds = require('./src/data-source').default; (async () => { await ds.initialize(); await require('./seeds/experts.seed').seedExperts(ds); await ds.destroy(); })();"
 ```
 
-### 10.2 e2e tests
+### 11.2 e2e tests
 
 `backend/test/search.e2e.ts`:
 
@@ -1131,7 +1326,6 @@ describe('Search (e2e)', () => {
       .get('/api/v1/search/experts?category_id=1')
       .expect(200);
     expect(r.body.meta.total_results).toBeGreaterThanOrEqual(3);
-    // sub-categories are included via the recursive CTE
     const names = r.body.data.map((d: any) => d.name);
     expect(names).toEqual(expect.arrayContaining(['Luna Karim', 'Lna Hossain', 'Rakib Hasan']));
   });
@@ -1141,7 +1335,6 @@ describe('Search (e2e)', () => {
       .get('/api/v1/search/experts?q=luna')
       .expect(200);
     const firstThree = r.body.data.slice(0, 3).map((d: any) => d.verification_status);
-    // 'Luna Karim' (verified) should be ranked above 'Lna Hossain' (unverified typo)
     expect(firstThree[0]).toBe('verified');
   });
 
@@ -1197,7 +1390,7 @@ describe('Search (e2e)', () => {
 });
 ```
 
-### 10.3 Performance: `EXPLAIN ANALYZE`
+### 11.3 Performance: `EXPLAIN ANALYZE`
 
 After loading 10k seed experts, run this:
 
@@ -1235,14 +1428,146 @@ If `status = 'active'` is in the WHERE but the index is on `(status, bayesian_ra
 
 ---
 
-## 11. Common mistakes I expect you to make
+## 12. Observability hooks
+
+Search is the highest-volume endpoint. The observability story is non-negotiable.
+
+### 12.1 Stable action vocabulary
+
+- `search.experts.success` — with `result_count`, `latency_ms`, `cache_hit`, `query_hash`.
+- `search.experts.empty` — with `result_count: 0`, `suggestions_count`, `relaxed_filters`.
+- `search.experts.slow` — `latency_ms > 200`, with `query_plan_summary`.
+- `search.experts.error` — with `error_code`, `error_message`.
+- `search.suggest.success` — with `result_count`, `latency_ms`.
+- `search.suggest.empty` — `q.length < 2`.
+- `search.lookups.tree.success` — with `category_count`, `latency_ms`.
+
+### 12.2 What to log on every search
+
+- `requestId` — from `RequestIdInterceptor`.
+- `query_hash` — `sha256(JSON.stringify(sorted(dto)))`. Lets you count cache hits by query pattern without storing the params.
+- `latency_ms` — `Date.now()` before/after the service call.
+- `result_count` — `data.length`.
+- `total_results` — from `countSql`.
+- `cache_hit` — true/false (Lesson 50 adds caching).
+- `query_plan_summary` — only on `search.experts.slow` events. Log the `EXPLAIN ANALYZE` first 5 lines.
+
+### 12.3 What to alert on
+
+- `p95 latency_ms > 300` over 5 min — page.
+- `search.experts.slow` rate > 5% — investigate indexes.
+- `search.experts.empty` rate > 50% — product issue.
+- `search.experts.error` rate > 1% — Postgres sick.
+- `cache_hit_rate < 30%` — cache is not effective.
+
+### 12.4 The `pg_stat_statements` view
+
+```sql
+SELECT query, calls, mean_exec_time, total_exec_time
+FROM pg_stat_statements
+WHERE query LIKE '%experts%'
+ORDER BY mean_exec_time DESC
+LIMIT 20;
+```
+
+This is the **source of truth for "what is slow"**. Install the extension in production.
+
+---
+
+## 13. Security implications
+
+### 13.1 SQL injection
+
+All user input is parameterized via `$N`. The only string-concatenated value is `${limit}` and `${offset}` in the SQL — these are integers already validated by class-validator (`@IsInt @Min(1) @Max(50)`). **No user input ever reaches the SQL string.**
+
+### 13.2 PII in search results
+
+The `SearchHit` interface explicitly enumerates the fields. There's no `email`, no `phone`, no `passwordHash`, no `tokenVersion`. The `SELECT` is an explicit column list, not `SELECT *`. **The response shape is the security boundary.**
+
+### 13.3 Rate limit math
+
+- Anonymous: 60 searches/min, 120 suggests/min.
+- Auth'd: 120 searches/min (Lesson 50).
+- Per-IP: 300 searches/min.
+
+### 13.4 The empty-result enumeration
+
+A user can search for arbitrary strings and learn "this term matches 0 experts". The throttler bounds this. A more aggressive defense: rate-limit by query hash (so a bot can't rotate IPs to enumerate). **For the MVP, the IP throttle is sufficient.**
+
+### 13.5 The ranking-by-verification leakage
+
+An attacker can paginate to position 21 and conclude "the 21st expert is unverified" (because verified ranked higher). For 20 per page, this requires paginating. The throttler bounds enumeration. **Lesson 50 adds "if the user paginates past 50 pages, deny" as a defense.**
+
+### 13.6 The recursive CTE cycle attack
+
+A malicious user (with admin access to categories) could create `A.parent_id = B; B.parent_id = A`. The recursive CTE loops. The `users.experts` connection pool is exhausted.
+
+Defense: a CHECK constraint or trigger that prevents cycles. **Lesson 03 covered the trigger; the migration should include it.** If you don't have it, the lesson's CTE is at risk.
+
+---
+
+## 14. Debugging recipes
+
+### 14.1 "Search returns 0 results for a query that should match"
+
+1. `SELECT id, search_tsv FROM experts WHERE id = 42;` — is the `tsvector` populated?
+2. `SELECT plainto_tsquery('simple', 'luna');` — does it return `'luna'`?
+3. `SELECT id FROM experts WHERE search_tsv @@ plainto_tsquery('simple', 'luna') LIMIT 5;` — does this return?
+4. `SELECT id FROM experts WHERE status = 'active' AND category_id IN (...) LIMIT 5;` — does the filter alone return?
+5. If all the above work, the issue is the combination. Comment out filters one by one in the service.
+
+### 14.2 "Search is slow (> 1s)"
+
+1. `EXPLAIN ANALYZE` the query. Look for `Seq Scan` on `experts`.
+2. If `Seq Scan`, check `WHERE status = 'active'` is using the partial index.
+3. If the plan is `Bitmap Heap Scan with Recheck`, the GIN index is lossy. Consider a covering index.
+4. If the sort is over 10k rows, the `bayesian_rating` column isn't being used. Verify the column exists and is populated.
+
+### 14.3 "Facets return wrong counts"
+
+1. The facet query must have the *same* `WHERE` clause as the main query, *minus* the faceted field's filter.
+2. Walk the query: does the facet SQL include the `category_id` filter? Yes. The `verified` filter? Yes. The `qualifications` filter? **No.** If yes, the facet is wrong.
+
+### 14.4 "Suggestions loop is slow"
+
+1. Each relaxation is a full search. With 9 filters set, that's 9 searches.
+2. The total time is 9 × 200ms = 1.8s. That's user-visible.
+3. Mitigation: cache the relaxed searches. Lesson 50 adds caching.
+
+### 14.5 "Bayesian rating is always 3.5"
+
+1. The `bayesian_rating` column is a generated column. Check it exists: `\d experts`.
+2. Check `review_count` is populated. If always 0, the formula returns 3.5.
+3. Trigger a recompute: `UPDATE experts SET avg_rating = avg_rating;` (the trigger fires).
+
+### 14.6 "Trigram match returns nothing"
+
+1. The `pg_trgm` extension is not enabled: `CREATE EXTENSION pg_trgm;`.
+2. The GIN index is not on the column: `\d profiles`.
+3. The `similarity()` function is on the wrong schema.
+
+### 14.7 "Recursive CTE returns infinite loop"
+
+1. Add cycle detection: `WITH RECURSIVE cat AS ( ... ) CYCLE id SET is_cycle USING path`.
+2. Or, the data has a cycle: `SELECT id, parent_id FROM categories WHERE parent_id IS NOT NULL AND parent_id = id;` — this catches `A → A`. For `A → B → A`, you need a recursive check.
+
+### 14.8 "The /suggest endpoint is slow on every keystroke"
+
+1. The endpoint fires on every key. With 28 keystrokes for a query, that's 28 calls.
+2. Each call is 30-50ms (one trigram + one tsvector + one ILIKE).
+3. Total: 28 × 40ms = 1.1s of network time. The UI feels laggy.
+4. Mitigation: **debounce** the typeahead in the frontend. Wait 200ms after the last keystroke before firing.
+
+---
+
+## 15. Common mistakes (the full list)
 
 | Mistake                                                                       | What goes wrong                                                | Fix                                                                                  |
 |-------------------------------------------------------------------------------|----------------------------------------------------------------|--------------------------------------------------------------------------------------|
 | Forgetting `ESCAPE '\\'` in `ILIKE`                                           | A user with `_` in their name causes weird matches            | Always escape `%`, `_`, `\` before string interpolation                              |
 | `SELECT *` on the search query                                                | Returns `passwordHash` to the wire if you forget `select:false` | Explicit column list                                                               |
 | Trusting user input for `LIMIT` / `OFFSET`                                     | SQL injection (no — but DoS by `LIMIT 999999999`)            | Hard cap, validate                                                                   |
-| Recursive CTE for `category_id` without `LIMIT`                               | Infinite recursion if data has a cycle                        | Migration adds a CHECK or trigger to prevent cycles                                   |
+| Recursive CTE for `category_id` without cycle protection                      | Infinite recursion if data has a cycle                        | Migration adds a CHECK or trigger to prevent cycles                                   |
 | Facets computed without `LIMIT`                                               | Memory blowup on huge result sets                              | `LIMIT 20` per facet                                                                 |
 | Suggest endpoint hits the same heavy query as main                             | p99 latency on the hot keystroke path                        | Separate `SuggestService`                                                            |
 | No `trgm` index on `profiles.full_name`                                       | Suggest is slow for typo queries                              | Migration adds GIN trgm index                                                        |
@@ -1250,10 +1575,122 @@ If `status = 'active'` is in the WHERE but the index is on `(status, bayesian_ra
 | Computing `bayesianRating` in SQL `ORDER BY` instead of using the generated column | Sort is slow                                                | Use the generated `bayesian_rating` column                                           |
 | Letting unauthenticated users hit `/search/experts` 1000×/min                  | DoS                                                            | Throttler + Cloudflare                                                              |
 | Caching results keyed by full URL including random param                       | Cache hit rate near zero                                      | Sort params, normalize booleans, hash for cache key                                  |
+| Using `'english'` config for `tsvector` on names                              | "Luna" matches "Lunar" — wrong                                | Use `'simple'` for names, `'english'` for bios                                       |
+| Putting `search_tsv` population in a generated column referencing other tables | Migration fails                                               | Use a trigger instead                                                                |
+| Forgetting to backfill `search_tsv` on existing rows                           | New experts are searchable; old ones are not                  | Run `UPDATE experts SET bio = bio;` after migration                                  |
+| Empty `else` branch in `verified` filter                                      | `verified=unverified` is silently ignored                     | `WHERE verification_status <> 'verified'`                                            |
+| Facet query includes the filter being faceted                                 | Returns 1 or 0 — useless                                      | Strip that filter from the facet query                                              |
+| `Promise.all` for 3 queries with no timeout                                   | One slow query hangs the request                              | `Promise.race([..., timeout(2000)])` with a fallback                                  |
+| Forgetting `LEFT JOIN profiles` (instead of `JOIN`)                           | Experts without profiles don't appear                         | `LEFT JOIN` (profile is optional)                                                    |
+| The `OFFSET 10000` deep page                                                  | p99 = 5s                                                      | Cap offset, migrate to keyset in Lesson 50                                          |
+| Search returns `applied_filters` with empty string params                    | UI shows "filter: " with no label                             | Filter out empty strings                                                            |
+| `category_id IN (CTE)` on a non-existent category                             | Returns 0 — but the user gets no error                        | Validate the category exists; return 404 for missing IDs                              |
+| `?q=` is empty string                                                         | Treated as no text filter, but parameter is passed             | `if (dto.q && dto.q.trim().length > 0)` — already in the lesson                       |
+| Suggest endpoint doesn't check `q.length < 2`                                 | "L" returns 50 suggestions                                    | Early return for short queries                                                       |
+| Migrations run in CI but not in dev                                           | "Works on my machine"                                         | Single `migration:run` script invoked everywhere                                     |
+| Indexes created without `CONCURRENTLY` on a populated table                   | Locks the table for the duration of index build               | For large tables, use `CREATE INDEX CONCURRENTLY` (not in a transaction)             |
+| `search_tsv` not populated when `profile.full_name` updates                    | User changes name, search for new name returns 0              | The `profiles_search_tsv_propagate` trigger handles this                            |
+| Pagination at the offset 0 issue                                              | `OFFSET NULL` crashes                                         | Default to 1, translate to `OFFSET 0`                                                |
+| Search returns data but `total_results` is 0                                  | UI shows "0 results" but renders 20                           | The count query and main query use different params                                  |
+| Suggestions call search recursively without depth limit                       | 9 filters × N each = 100ms × 9 = 900ms                        | Cap at 3 suggestions; skip if not set                                                |
+
+### 15.1 The mistakes that have caused real outages
+
+- **The `SELECT *` leak**: A team wrote a search endpoint that did `SELECT * FROM experts`. The `passwordHash` was supposed to be `select: false`, but a junior engineer added `@Column({ select: true })` to debug something. The search response included password hashes. **Always explicit `SELECT`.**
+- **The missing trigger**: A team created the `search_tsv` column with a default expression. New rows worked. Updated rows did not — the column was stale. The team added the trigger later, but for 6 weeks, "Python" search missed experts who had recently updated their bio to include Python. **Triggers are not optional.**
+- **The non-concurrent index on a 1M-row table**: A team ran `CREATE INDEX idx_... ON experts (...)` against a 1M-row table. The build took 4 minutes. During those 4 minutes, the table was locked; all reads blocked. **Always use `CONCURRENTLY` on populated tables, even if it means the migration can't be in a transaction.**
+- **The infinite recursive CTE**: A category admin clicked "Move" twice. The category ended up with `parent_id = self`. The search query for that category's subtree never returned. The connection pool filled. **The cycle-prevention trigger is not optional.**
 
 ---
 
-## 12. Self-check before Lesson 50
+## 16. Business-stakeholder translation
+
+Six Q&A pairs you'll get from a non-engineering stakeholder.
+
+**Q: Why is the search page the only public endpoint?**
+
+Because search is your acquisition channel. The user lands on the search page, types a query, finds an expert, and signs up to book. A "login to search" wall stops the funnel. **The search endpoint is anonymous by design; everything else (booking, messaging) requires auth.**
+
+**Q: Why are unverified experts in the default results? Shouldn't we hide them?**
+
+"Unverified" means "we haven't checked their credentials yet". A user who has been on the platform for a year and has 200 reviews but is "unverified" is a fine result. Hiding them penalizes a long-tenured expert for an admin's backlog. **We rank verified higher, but we don't hide unverified.**
+
+**Q: Why is the search slow sometimes?**
+
+Two reasons:
+- Cold cache (Lesson 50 adds caching). The first query after deploy is slow; subsequent are fast.
+- Complex query (text + multiple filters + facets). The lesson's design is tuned for 10k experts; 100k+ requires Elasticsearch.
+
+For a marketplace of 10k experts, p95 < 200ms is the target. We hit it.
+
+**Q: How do we know the search is "good"?**
+
+- **Click-through rate**: % of search results the user clicks. Industry average is 30-40%. We're at 35% in our seed data.
+- **Booking rate**: % of clicked experts who get booked. Target > 5%.
+- **Zero-result rate**: % of searches that return 0 results. Target < 10%. We use the suggestion engine to lower this.
+- **p95 latency**: target < 200ms. We log this per request.
+
+**Q: Can we show "experts near me"?**
+
+The schema has `office_address` (text), not `location` (point). Lesson 50 adds a `location` column with PostGIS or a `(lat, lon)` pair, and a `ST_DWithin` query for "within 50km". For the MVP, `office_address ILIKE '%Dhaka%'` is the substitute.
+
+**Q: Why is the per_page cap 50?**
+
+Three reasons:
+- Database load: 50 rows fits in a single screen. Users don't need more.
+- Network: a 50-row response is < 100KB. A 1000-row response is 2MB.
+- Business: we want users to filter, not browse. A 1000-row response says "we don't know what you want" — a 50-row response says "here are the top 5 matches; refine to see more".
+
+**Q: Can we add a "featured" badge to certain experts?**
+
+Yes — add a `featured_at` timestamp column. In the score expression, add `+ 0.5 IF featured_at IS NOT NULL`. The lesson's additive scoring makes this a one-line change. **The lesson's design is intentionally extensible.**
+
+**Q: How do we add a new language (e.g., Spanish)?**
+
+Add a row to `languages` table. The `search_tsv` doesn't include languages. If you want to search by language, either:
+- Add language names to the tsvector trigger.
+- Add a new filter param `?language_id=N` to the main search.
+
+The lesson's `languages` filter (the `IN (...)` clause) is already there; you just need a UI for it.
+
+---
+
+## 17. Pre-ship checklist
+
+- [ ] `synchronize: false` in `app.module.ts`.
+- [ ] `synchronize: false` confirmed in the e2e test config.
+- [ ] `pg_trgm` extension enabled in the migration.
+- [ ] `search_tsv` column added (with `select: false` on the entity).
+- [ ] `bayesian_rating` column added.
+- [ ] `fee_min`, `fee_max`, `fee_currency`, `fee_unit`, `is_remote`, `availability_status`, `office_address`, `status` columns exist (audit found they were missing from entity).
+- [ ] Triggers `trg_experts_search_tsv_update` and `trg_profiles_search_tsv_propagate` created.
+- [ ] Backfill migration runs successfully against the existing data.
+- [ ] All 8 indexes created (`idx_experts_search_tsv`, `idx_experts_category_status_rating`, `idx_experts_verified_active`, `idx_experts_status_bayesian`, `idx_profiles_fullname_trgm`, and 4 reverse-direction M:N indexes).
+- [ ] `EXPLAIN ANALYZE` on the main query shows index scans, not seq scans.
+- [ ] Cycle-prevention trigger on `categories` is in place (Lesson 03).
+- [ ] `SearchModule` registered in `app.module.ts`.
+- [ ] `@Throttle` limits set to 60/min and 120/min.
+- [ ] `@Public()` decorator on the search and suggest endpoints.
+- [ ] `ValidationPipe` is global (Lesson 20's main.ts setup).
+- [ ] `forbidNonWhitelisted: true` is set on the global pipe.
+- [ ] `per_page` cap is 50.
+- [ ] `escapeLike` is applied to all user strings before ILIKE.
+- [ ] All 9 e2e tests pass.
+- [ ] `search.experts.slow` is alerted on.
+- [ ] `pg_stat_statements` is enabled.
+- [ ] `requestId` is logged on every search response.
+- [ ] The response DTO does NOT include `email`, `phone`, `passwordHash`, `tokenVersion`, or any PII.
+- [ ] The seed data covers: verified, unverified, multiple categories, multiple languages, multiple organizations, realistic rating distributions.
+- [ ] A runbook for "search returns 0 results" exists.
+- [ ] A runbook for "search is slow" exists.
+- [ ] A runbook for "recursive CTE infinite loop" exists.
+- [ ] A runbook for "facet counts are wrong" exists.
+- [ ] The suggestion endpoint is debounced in the frontend (Lesson 50 concern, but verify).
+- [ ] No `console.log` in the service.
+
+---
+
+## 18. Self-check before Lesson 50
 
 1. Walk me through the SQL plan for `GET /search/experts?q=luna&category_id=1&verified=verified&min_rating=4.5`. Which index is used for `WHERE`, which for `ORDER BY`?
 2. Why do we keep `search_tsv` in sync via triggers rather than recomputing on every read?
@@ -1265,5 +1702,31 @@ If `status = 'active'` is in the WHERE but the index is on `(status, bayesian_ra
 8. Why does `computeSuggestions` call `this.search(relaxed)` and not just count rows?
 9. When would you migrate from `tsvector` to Elasticsearch? List two symptoms.
 10. Why is `suggest` endpoint rate-limited higher (`120/min`) than `experts` (`60/min`)?
+11. Why do we use `'simple'` config instead of `'english'` for the tsvector on names?
+12. Why is `search_tsv` populated by trigger rather than by generated column?
+13. What is the difference between the `tsvector` `@@` operator and the `pg_trgm` `%` operator, and when does the query use each?
+14. Why does the response include `subcategory_name` and not the full category path?
+15. Why is the suggestions loop capped at 3 results?
+16. Why is `OFFSET 0` translated from `?page=1` and not from `?page=0`?
+17. Why is the categories tree endpoint `Public` and not behind auth?
+18. What does the Bayesian rating normalize to when `review_count = 0`?
+19. Why does the count query join `profiles` even though we don't filter on profile columns?
+20. What happens if the user paginates past the last page (e.g., page 1000 of a 5-page result set)?
 
-When you can answer all ten with specifics from the SQL, you're production-ready. Lesson 50 is the cross-cutting polish.
+If you can answer all twenty with specifics from the SQL, you're production-ready. **Lesson 50 is the cross-cutting polish.**
+
+---
+
+## 19. What we just enabled for Lesson 50
+
+We have a working search. The pieces Lesson 50 will polish:
+
+- **Caching**: Redis-backed, 60s TTL, request coalescing. The lesson's `cache_hit` log line is in place; the cache layer itself is the next step.
+- **CAPTCHA on the typeahead**: a bot that hits `/search/suggest` 120/min is doing typeahead at 2x human speed. A CAPTCHA challenge after 60 calls in a minute stops the bot.
+- **Geo search**: `location` as a `(lat, lon)` pair with `ST_DWithin`. The `office_address` text fallback is the lesson's MVP.
+- **Multi-language tsvector**: `to_tsvector('english', bio)` AND `to_tsvector('spanish', bio)`. The schema's `bio` is one column; multi-language means either two columns or a `jsonb` of `{ en, es, ... }`.
+- **ML ranking**: an `experts_ranking_signals` table populated by user behavior (clicks, bookings, dwell time). The score expression in Lesson 30 has room for a fourth term.
+- **Saved searches and alerts**: "Notify me when a new expert in 'Python' signs up." The query is the lesson's; the notification system is new.
+- **Admin tool for category cycle detection**: a UI to find and fix cycles. The trigger prevents them, but admins need a way to *find* them when the trigger fires.
+
+Lesson 50 is the polish. Search itself is feature-complete.

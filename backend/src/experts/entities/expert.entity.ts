@@ -8,6 +8,7 @@ import {
   Column,
   CreateDateColumn,
   Entity,
+  Index,
   JoinColumn,
   JoinTable,
   ManyToMany,
@@ -31,11 +32,27 @@ export enum AvailabilityStatus {
   UNAVAILABLE = 'unavailable',
 }
 
+/**
+ * Expert — a user's professional profile.
+ *
+ * Cardinality notes (per Lesson 02):
+ *   - Expert M — 1 User (owning side: FK user_id on experts, with UNIQUE for soft-1:1
+ *     enforcement; see the migration that adds the UNIQUE constraint).
+ *   - Expert M — 1 Category (Categories 1—N Experts).
+ *   - Expert M — N Qualification / Language / Organization / Price via implicit pivots
+ *     expert_qualifications / expert_languages / expert_organizations / expert_prices.
+ *     The pivot tables get composite PK + ON DELETE CASCADE added by the migration;
+ *     TypeORM's @JoinTable does not infer these.
+ */
 @Entity()
+@Index('idx_experts_user_id', ['user'])
+@Index('idx_experts_category_id', ['category'])
 export class Expert {
   @PrimaryGeneratedColumn()
   id!: number;
 
+  // Owning side: Expert holds the user_id FK. The migration adds UNIQUE
+  // (user_id) so that a user can have at most one expert row (soft-1:1).
   @ManyToOne(() => User, (user) => user.experts, {
     onDelete: 'CASCADE',
     nullable: false,
@@ -43,7 +60,11 @@ export class Expert {
   @JoinColumn({ name: 'user_id' })
   user!: User;
 
-  @ManyToOne(() => Category, { onDelete: 'RESTRICT', nullable: false })
+  // Owning side: Categories 1—N Experts (Categories.parent FK on experts.category_id).
+  @ManyToOne(() => Category, (category) => category.experts, {
+    onDelete: 'RESTRICT',
+    nullable: false,
+  })
   @JoinColumn({ name: 'category_id' })
   category!: Category;
 
